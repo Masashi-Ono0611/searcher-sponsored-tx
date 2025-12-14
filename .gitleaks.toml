@@ -1,0 +1,8 @@
+title = "gitleaks config"
+
+[allowlist]
+description = "Allow common Ethereum contract addresses and other non-secret hex literals"
+regexes = [
+  # Ethereum-style 20-byte hex address (e.g. ERC20 contract address)
+  '''0x[a-fA-F0-9]{40}'''
+]

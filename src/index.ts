@@ -9,16 +9,27 @@ import { checkSimulation, gasPriceToGwei, printTransactions } from "./utils";
 import { Approval721 } from "./engine/Approval721";
 
 require('log-timestamp');
+require('dotenv/config');
 
 const BLOCKS_IN_FUTURE = 2;
+const BLOCKS_TO_TARGET = parseInt(process.env.BLOCKS_TO_TARGET || "10", 10);
 
 const GWEI = BigNumber.from(10).pow(9);
-const PRIORITY_GAS_PRICE = GWEI.mul(31)
+const PRIORITY_FEE_GWEI = BigNumber.from(process.env.PRIORITY_FEE_GWEI || "31");
+const PRIORITY_GAS_PRICE = PRIORITY_FEE_GWEI.mul(GWEI)
 
 const PRIVATE_KEY_EXECUTOR = process.env.PRIVATE_KEY_EXECUTOR || ""
 const PRIVATE_KEY_SPONSOR = process.env.PRIVATE_KEY_SPONSOR || ""
 const FLASHBOTS_RELAY_SIGNING_KEY = process.env.FLASHBOTS_RELAY_SIGNING_KEY || "";
 const RECIPIENT = process.env.RECIPIENT || ""
+
+const NETWORK = (process.env.NETWORK || "sepolia").toLowerCase();
+const RPC_URL = process.env.ETHEREUM_RPC_URL || "";
+const FLASHBOTS_RELAY_URL = process.env.FLASHBOTS_RELAY_URL || (NETWORK === "sepolia" ? "https://relay-sepolia.flashbots.net" : "https://relay.flashbots.net");
+
+const ENGINE = (process.env.ENGINE || "approval721").toLowerCase();
+const ERC20_TOKEN_ADDRESS = process.env.ERC20_TOKEN_ADDRESS || "";
+const APPROVAL721_CONTRACTS = (process.env.APPROVAL721_CONTRACTS || "").split(",").map((s) => s.trim()).filter(Boolean);
 
 if (PRIVATE_KEY_EXECUTOR === "") {
   console.warn("Must provide PRIVATE_KEY_EXECUTOR environment variable, corresponding to Ethereum EOA with assets to be transferred")
@@ -37,34 +48,37 @@ if (RECIPIENT === "") {
   process.exit(1)
 }
 
+if (RPC_URL === "") {
+  console.warn("Must provide ETHEREUM_RPC_URL environment variable")
+  process.exit(1)
+}
+
 async function main() {
   const walletRelay = new Wallet(FLASHBOTS_RELAY_SIGNING_KEY)
 
-  // ======= UNCOMMENT FOR GOERLI ==========
-  const provider = new providers.InfuraProvider(5, process.env.INFURA_API_KEY || '');
-  const flashbotsProvider = await FlashbotsBundleProvider.create(provider, walletRelay, 'https://relay-goerli.epheph.com/');
-  // ======= UNCOMMENT FOR GOERLI ==========
-
-  // ======= UNCOMMENT FOR MAINNET ==========
-  // const ETHEREUM_RPC_URL = process.env.ETHEREUM_RPC_URL || "http://127.0.0.1:8545"
-  // const provider = new providers.StaticJsonRpcProvider(ETHEREUM_RPC_URL);
-  // const flashbotsProvider = await FlashbotsBundleProvider.create(provider, walletRelay);
-  // ======= UNCOMMENT FOR MAINNET ==========
+  const provider = new providers.StaticJsonRpcProvider(RPC_URL);
+  const flashbotsProvider = await FlashbotsBundleProvider.create(provider, walletRelay, FLASHBOTS_RELAY_URL);
 
   const walletExecutor = new Wallet(PRIVATE_KEY_EXECUTOR);
   const walletSponsor = new Wallet(PRIVATE_KEY_SPONSOR);
 
   const block = await provider.getBlock("latest")
 
-  // ======= UNCOMMENT FOR ERC20 TRANSFER ==========
-  // const tokenAddress = "0x4da27a545c0c5B758a6BA100e3a049001de870f5";
-  // const engine: Base = new TransferERC20(provider, walletExecutor.address, RECIPIENT, tokenAddress);
-  // ======= UNCOMMENT FOR ERC20 TRANSFER ==========
-
-  // ======= UNCOMMENT FOR 721 Approval ==========
-  const HASHMASKS_ADDRESS = "0xC2C747E0F7004F9E8817Db2ca4997657a7746928";
-  const engine: Base = new Approval721(RECIPIENT, [HASHMASKS_ADDRESS]);
-  // ======= UNCOMMENT FOR 721 Approval ==========
+  let engine: Base;
+  if (ENGINE === "transfererc20") {
+    if (ERC20_TOKEN_ADDRESS === "") {
+      console.warn("Must provide ERC20_TOKEN_ADDRESS when ENGINE=transfererc20")
+      process.exit(1)
+    }
+    const { TransferERC20 } = await import("./engine/TransferERC20");
+    engine = new TransferERC20(provider, walletExecutor.address, RECIPIENT, ERC20_TOKEN_ADDRESS);
+  } else {
+    if (APPROVAL721_CONTRACTS.length === 0) {
+      console.warn("Must provide APPROVAL721_CONTRACTS (comma-separated) when ENGINE=approval721")
+      process.exit(1)
+    }
+    engine = new Approval721(provider, RECIPIENT, APPROVAL721_CONTRACTS);
+  }
 
   const sponsoredTransactions = await engine.getSponsoredTransactions();
 
@@ -110,23 +124,31 @@ async function main() {
   console.log(`Gas Price: ${gasPriceToGwei(gasPrice)} gwei`)
   console.log(`Gas Used: ${gasEstimateTotal.toString()}`)
 
+  console.log(`Network: ${NETWORK}`)
+  console.log(`Relay: ${FLASHBOTS_RELAY_URL}`)
+  console.log(`Blocks to target: ${BLOCKS_TO_TARGET}`)
+
   provider.on('block', async (blockNumber) => {
     const simulatedGasPrice = await checkSimulation(flashbotsProvider, signedBundle);
-    const targetBlockNumber = blockNumber + BLOCKS_IN_FUTURE;
-    console.log(`Current Block Number: ${blockNumber},   Target Block Number:${targetBlockNumber},   gasPrice: ${gasPriceToGwei(simulatedGasPrice)} gwei`)
-    const bundleResponse = await flashbotsProvider.sendBundle(bundleTransactions, targetBlockNumber);
-    if ('error' in bundleResponse) {
-      throw new Error(bundleResponse.error.message)
-    }
-    const bundleResolution = await bundleResponse.wait()
-    if (bundleResolution === FlashbotsBundleResolution.BundleIncluded) {
-      console.log(`Congrats, included in ${targetBlockNumber}`)
-      process.exit(0)
-    } else if (bundleResolution === FlashbotsBundleResolution.BlockPassedWithoutInclusion) {
-      console.log(`Not included in ${targetBlockNumber}`)
-    } else if (bundleResolution === FlashbotsBundleResolution.AccountNonceTooHigh) {
-      console.log("Nonce too high, bailing")
-      process.exit(1)
+    const firstTargetBlockNumber = blockNumber + BLOCKS_IN_FUTURE;
+    console.log(`Current Block Number: ${blockNumber},   First Target Block Number:${firstTargetBlockNumber},   gasPrice: ${gasPriceToGwei(simulatedGasPrice)} gwei`)
+
+    for (let i = 0; i < BLOCKS_TO_TARGET; i++) {
+      const targetBlockNumber = firstTargetBlockNumber + i;
+      const bundleResponse = await flashbotsProvider.sendBundle(bundleTransactions, targetBlockNumber);
+      if ('error' in bundleResponse) {
+        throw new Error(bundleResponse.error.message)
+      }
+      const bundleResolution = await bundleResponse.wait()
+      if (bundleResolution === FlashbotsBundleResolution.BundleIncluded) {
+        console.log(`Congrats, included in ${targetBlockNumber}`)
+        process.exit(0)
+      } else if (bundleResolution === FlashbotsBundleResolution.BlockPassedWithoutInclusion) {
+        console.log(`Not included in ${targetBlockNumber}`)
+      } else if (bundleResolution === FlashbotsBundleResolution.AccountNonceTooHigh) {
+        console.log("Nonce too high, bailing")
+        process.exit(1)
+      }
     }
   })
 }
